@@ -1,0 +1,6 @@
+name = "momon-ga-proxy-worker"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+[vars]
+ENCRYPTION_KEY_HEX = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

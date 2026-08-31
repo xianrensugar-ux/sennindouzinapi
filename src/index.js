@@ -3,53 +3,15 @@ import { cors } from 'hono/cors';
 
 const app = new Hono();
 
+// CORS設定
 app.use('*', cors({
     origin: '*',
     allowMethods: ['GET', 'POST', 'OPTIONS'],
     allowHeaders: ['Content-Type', 'X-Requested-With']
 }));
 
-const memoryCache = new Map();
-async function getCryptoKey(hexKey) {
-    const keyBytes = new Uint8Array(hexKey.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
-    return await crypto.subtle.importKey(
-        'raw',
-        keyBytes,
-        { name: 'AES-CBC' },
-        false,
-        ['encrypt', 'decrypt']
-    );
-}
-
-async function encryptBuffer(arrayBuffer, keyHex) {
-    const key = await getCryptoKey(keyHex);
-    const iv = crypto.getRandomValues(new Uint8Array(16));
-    const encrypted = await crypto.subtle.encrypt(
-        { name: 'AES-CBC', iv },
-        key,
-        arrayBuffer
-    );
-    
-    const result = new Uint8Array(iv.length + encrypted.byteLength);
-    result.set(iv, 0);
-    result.set(new Uint8Array(encrypted), iv.length);
-    return result;
-}
-
-async function decryptBuffer(encryptedBytes, keyHex) {
-    const key = await getCryptoKey(keyHex);
-    const iv = encryptedBytes.slice(0, 16);
-    const data = encryptedBytes.slice(16);
-    
-    return await crypto.subtle.decrypt(
-        { name: 'AES-CBC', iv },
-        key,
-        data
-    );
-}
-
-// 画像キャッシュ登録処理
-async function registerImageProxy(url, env, baseUrl) {
+// 画像URLを取得して Base64 データURI に変換する関数
+async function fetchAsBase64(url) {
     if (!url) return null;
     try {
         const response = await fetch(url, {
@@ -64,29 +26,18 @@ async function registerImageProxy(url, env, baseUrl) {
         const contentType = response.headers.get('content-type') || 'image/jpeg';
         const arrayBuffer = await response.arrayBuffer();
         
-        const keyHex = env.ENCRYPTION_KEY_HEX || '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
-        const encryptedBytes = await encryptBuffer(arrayBuffer, keyHex);
-
-        const imageId = crypto.randomUUID().replace(/-/g, '');
-
-        // KVがバインドされている場合はKVを使用、なければメモリ領域に保持
-        if (env.IMAGE_CACHE) {
-            await env.IMAGE_CACHE.put(imageId, encryptedBytes, {
-                expirationTtl: 180, // 3分間保持
-                metadata: { contentType }
-            });
-        } else {
-            memoryCache.set(imageId, {
-                buffer: encryptedBytes,
-                contentType: contentType
-            });
-            setTimeout(() => memoryCache.delete(imageId), 180000);
+        // Uint8Array から Base64 文字列へ変換
+        let binary = '';
+        const bytes = new Uint8Array(arrayBuffer);
+        const len = bytes.byteLength;
+        for (let i = 0; i < len; i++) {
+            binary += String.fromCharCode(bytes[i]);
         }
+        const base64String = btoa(binary);
 
-        return `${baseUrl}/api/image/${imageId}`;
-
+        return `data:${contentType};base64,${base64String}`;
     } catch (e) {
-        console.error(`Image Cache Error: ${url}`, e.message);
+        console.error(`Base64 Fetch Error: ${url}`, e.message);
         return null;
     }
 }
@@ -100,7 +51,7 @@ app.get('/api/search', async (c) => {
         const targetUrl = `https://momon-ga.com/?s=${encodeURIComponent(query)}`;
         const response = await fetch(targetUrl, {
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
         });
 
@@ -109,18 +60,16 @@ app.get('/api/search', async (c) => {
         const postRegex = /<a href="https:\/\/momon-ga\.com\/(?:fanzine|magazine)\/(mo[0-9-]+)\/">[\s\S]*?<img src="([^"]+)"[\s\S]*?alt="([^"]+)"/g;
 
         let match;
-        const originUrl = new URL(c.req.url).origin;
-
         while ((match = postRegex.exec(html)) !== null) {
             const id = match[1];
             const imgUrl = match[2];
             const title = match[3];
 
             tasks.push((async () => {
-                const proxyImageUrl = await registerImageProxy(imgUrl, c.env, originUrl);
+                const base64Image = await fetchAsBase64(imgUrl);
                 return {
                     id: id,
-                    image: proxyImageUrl,
+                    image: base64Image,
                     title: title,
                     rule: ""
                 };
@@ -141,14 +90,24 @@ app.get('/api/proxy-details', async (c) => {
     const id = c.req.query('id');
     if (!id) return c.text("ID is required", 400);
 
-    const targetUrl = `https://momon-ga.com/fanzine/${id}`;
+    const targetUrl = `https://momon-ga.com/fanzine/${id}/`;
 
     try {
         const response = await fetch(targetUrl, {
-            headers: { 'User-Agent': 'Mozilla/5.0' }
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
         });
 
         const htmlString = await response.text();
+
+        // 1. Title タグの取得
+        const titleMatch = htmlString.match(/<title>([\s\S]*?)<\/title>/i);
+        const rawTitle = titleMatch ? titleMatch[1].trim() : "";
+
+        // 2. Meta Description の取得
+        const descMatch = htmlString.match(/<meta\s+name="description"\s+content="([^"]*)"/i);
+        const rawDescription = descMatch ? descMatch[1].trim() : "";
+
+        // 3. ギャラリー画像の取得 & Base64化
         const imgUrls = [];
         const galleryRegex = /src="([^"]*galleries[^"]*)"/g;
 
@@ -162,39 +121,33 @@ app.get('/api/proxy-details', async (c) => {
         }
 
         const uniqueImgUrls = [...new Set(imgUrls)];
-        const originUrl = new URL(c.req.url).origin;
-
-        const proxyImageUrls = await Promise.all(
-            uniqueImgUrls.map(url => registerImageProxy(url, c.env, originUrl))
+        const base64Images = await Promise.all(
+            uniqueImgUrls.map(url => fetchAsBase64(url))
         );
+        const filteredImages = base64Images.filter(img => img !== null);
 
-        const filteredImages = proxyImageUrls.filter(img => img !== null);
+        // 4. Description 内部要素の抽出・構造化
+        const getMetaVal = (label) => {
+            const reg = new RegExp(`【${label}】\\s*([^【]+)`);
+            const m = rawDescription.match(reg);
+            return m ? m[1].trim() : "";
+        };
 
-        const titleMatch = htmlString.match(/<h1[^>]*>(.*?)<\/h1>/);
-        const title = titleMatch ? titleMatch[1].replace(/<[^>]*>?/gm, '').trim() : "No Title";
+        const parody = getMetaVal("パロディ");
+        const character = getMetaVal("キャラクター");
+        const circle = getMetaVal("サークル");
+        const author = getMetaVal("作者");
+        const tagsStr = getMetaVal("タグ");
+        const tags = tagsStr ? tagsStr.split(',').map(t => t.trim()) : [];
 
-        // メタ情報スクレイピング
-        const circleMatch = htmlString.match(/制作サークル\s*:\s*(?:<[^>]+>\s*)*<a[^>]*>([^<]+)<\/a>/i);
-        const circle = circleMatch ? circleMatch[1].trim() : "不明";
-
-        const authorMatch = htmlString.match(/作者\s*:\s*(?:<[^>]+>\s*)*<a[^>]*>([^<]+)<\/a>/i);
-        const author = authorMatch ? authorMatch[1].trim() : "不明";
-
+        // 5. ページ数・投稿日時の抽出
         const pagesMatch = htmlString.match(/ページ数\s*:\s*(?:<[^>]+>\s*)*(\d+)\s*ページ/i);
         const pages = pagesMatch ? parseInt(pagesMatch[1], 10) : 0;
 
         const dateMatch = htmlString.match(/公開\/投稿日時\s*:\s*(?:<[^>]+>\s*)*<time[^>]*>([^<]+)<\/time>/i);
         const postDate = dateMatch ? dateMatch[1].trim() : "不明";
 
-        // タグ取得
-        const tags = [];
-        const tagRegex = /<a\s+href="https:\/\/momon-ga\.com\/tag\/[^"]+"[^>]*>([^<]+)<\/a>/gi;
-        let tagMatch;
-        while ((tagMatch = tagRegex.exec(htmlString)) !== null) {
-            tags.push(tagMatch[1].trim());
-        }
-
-        // コメント取得
+        // 6. コメントの抽出
         const comments = [];
         const commentRegex = /<div\s+class="comment\s+[^"]*id="comment-(\d+)"[^>]*>([\s\S]*?)(?=<div\s+class="comment\s+|<div\s+id="respond"|<\/div>\s*<\/li>|$)/gi;
         let commentBlockMatch;
@@ -218,7 +171,7 @@ app.get('/api/proxy-details', async (c) => {
             }
         }
 
-        // 関連作品取得
+        // 7. 関連作品の取得
         const relatedTasks = [];
         const relatedRegex = /<a\s+href="https:\/\/momon-ga\.com\/(?:fanzine|magazine)\/(mo[0-9-]+)\/">[\s\S]*?<img[^>]*src="([^"]+)"[\s\S]*?alt="([^"]+)"[\s\S]*?(?:<div\s+class="post-list-wpulike">([^<]+)<\/div>)?[\s\S]*?<\/a>/gi;
         let relatedMatch;
@@ -229,20 +182,23 @@ app.get('/api/proxy-details', async (c) => {
             const relLikes = relatedMatch[4] ? relatedMatch[4].trim() : "";
 
             relatedTasks.push((async () => {
-                const proxyImageUrl = await registerImageProxy(relImgUrl, c.env, originUrl);
-                return { id: relId, title: relTitle, image: proxyImageUrl, likes: relLikes };
+                const base64Img = await fetchAsBase64(relImgUrl);
+                return { id: relId, title: relTitle, image: base64Img, likes: relLikes };
             })());
         }
         const related = await Promise.all(relatedTasks);
 
         return c.json({
-            title,
-            images: filteredImages,
+            title: rawTitle,
+            description: rawDescription,
+            parody,
+            character,
             circle,
             author,
             pages,
             postDate,
             tags,
+            images: filteredImages,
             comments,
             related
         });
@@ -253,68 +209,15 @@ app.get('/api/proxy-details', async (c) => {
     }
 });
 
-// 暗号化画像の配信 API
-app.get('/api/image/:id', async (c) => {
-    const imageId = c.req.param('id');
-    let encryptedBytes;
-    let contentType = 'image/jpeg';
-
-    if (c.env.IMAGE_CACHE) {
-        const { value, metadata } = await c.env.IMAGE_CACHE.getWithMetadata(imageId, { type: 'arrayBuffer' });
-        if (!value) return c.text("Image not found or expired", 404);
-        encryptedBytes = new Uint8Array(value);
-        if (metadata?.contentType) contentType = metadata.contentType;
-    } else {
-        const cached = memoryCache.get(imageId);
-        if (!cached) return c.text("Image not found or expired", 404);
-        encryptedBytes = cached.buffer;
-        contentType = cached.contentType;
-    }
-
-    try {
-        const keyHex = c.env.ENCRYPTION_KEY_HEX || '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
-        const decryptedBuffer = await decryptBuffer(encryptedBytes, keyHex);
-
-        return new Response(decryptedBuffer, {
-            headers: {
-                'Content-Type': contentType,
-                'Cache-Control': 'public, max-age=86400'
-            }
-        });
-    } catch (e) {
-        console.error("Decryption error details:", e.message);
-        return c.text("Decryption error", 500);
-    }
-});
-
-// ダイレクト画像プロキシ API
+// ダイレクト画像プロキシ API (Base64 返却版)
 app.get('/api/image-proxy', async (c) => {
     const imageUrl = c.req.query('url');
     if (!imageUrl) return c.text("URL is required", 400);
 
-    try {
-        const response = await fetch(imageUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Referer': 'https://momon-ga.com/'
-            }
-        });
+    const base64Data = await fetchAsBase64(imageUrl);
+    if (!base64Data) return c.text("Failed to fetch and convert image", 502);
 
-        if (!response.ok) return c.text("Failed to fetch image", 502);
-
-        const contentType = response.headers.get('content-type') || 'image/jpeg';
-        const imageBuffer = await response.arrayBuffer();
-
-        return new Response(imageBuffer, {
-            headers: {
-                'Content-Type': contentType,
-                'Cache-Control': 'public, max-age=86400'
-            }
-        });
-    } catch (e) {
-        console.error(e.message);
-        return c.text("Image proxy error", 500);
-    }
+    return c.json({ image: base64Data });
 });
 
 export default app;

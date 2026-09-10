@@ -3,14 +3,12 @@ import { cors } from 'hono/cors';
 
 const app = new Hono();
 
-// CORS設定
 app.use('*', cors({
     origin: '*',
     allowMethods: ['GET', 'POST', 'OPTIONS'],
     allowHeaders: ['Content-Type', 'X-Requested-With']
 }));
 
-// 画像URLを取得して Base64 データURI に変換する関数
 async function fetchAsBase64(url) {
     if (!url) return null;
     try {
@@ -26,7 +24,7 @@ async function fetchAsBase64(url) {
         const contentType = response.headers.get('content-type') || 'image/jpeg';
         const arrayBuffer = await response.arrayBuffer();
         
-        // Uint8Array から Base64 文字列へ変換
+    
         let binary = '';
         const bytes = new Uint8Array(arrayBuffer);
         const len = bytes.byteLength;
@@ -42,7 +40,6 @@ async function fetchAsBase64(url) {
     }
 }
 
-// 検索 API
 app.get('/api/search', async (c) => {
     const query = c.req.query('q');
     if (!query) return c.json({ result: [] });
@@ -85,7 +82,6 @@ app.get('/api/search', async (c) => {
     }
 });
 
-// 詳細取得 API
 app.get('/api/proxy-details', async (c) => {
     const id = c.req.query('id');
     if (!id) return c.text("ID is required", 400);
@@ -99,15 +95,15 @@ app.get('/api/proxy-details', async (c) => {
 
         const htmlString = await response.text();
 
-        // 1. Title タグの取得
+        
         const titleMatch = htmlString.match(/<title>([\s\S]*?)<\/title>/i);
         const rawTitle = titleMatch ? titleMatch[1].trim() : "";
 
-        // 2. Meta Description の取得
+        
         const descMatch = htmlString.match(/<meta\s+name="description"\s+content="([^"]*)"/i);
         const rawDescription = descMatch ? descMatch[1].trim() : "";
 
-        // 3. ギャラリー画像の取得 & Base64化
+        
         const imgUrls = [];
         const galleryRegex = /src="([^"]*galleries[^"]*)"/g;
 
@@ -126,7 +122,7 @@ app.get('/api/proxy-details', async (c) => {
         );
         const filteredImages = base64Images.filter(img => img !== null);
 
-        // 4. Description 内部要素の抽出・構造化
+       
         const getMetaVal = (label) => {
             const reg = new RegExp(`【${label}】\\s*([^【]+)`);
             const m = rawDescription.match(reg);
@@ -140,14 +136,14 @@ app.get('/api/proxy-details', async (c) => {
         const tagsStr = getMetaVal("タグ");
         const tags = tagsStr ? tagsStr.split(',').map(t => t.trim()) : [];
 
-        // 5. ページ数・投稿日時の抽出
+    
         const pagesMatch = htmlString.match(/ページ数\s*:\s*(?:<[^>]+>\s*)*(\d+)\s*ページ/i);
         const pages = pagesMatch ? parseInt(pagesMatch[1], 10) : 0;
 
         const dateMatch = htmlString.match(/公開\/投稿日時\s*:\s*(?:<[^>]+>\s*)*<time[^>]*>([^<]+)<\/time>/i);
         const postDate = dateMatch ? dateMatch[1].trim() : "不明";
 
-        // 6. コメントの抽出
+      
         const comments = [];
         const commentRegex = /<div\s+class="comment\s+[^"]*id="comment-(\d+)"[^>]*>([\s\S]*?)(?=<div\s+class="comment\s+|<div\s+id="respond"|<\/div>\s*<\/li>|$)/gi;
         let commentBlockMatch;
@@ -171,7 +167,7 @@ app.get('/api/proxy-details', async (c) => {
             }
         }
 
-        // 7. 関連作品の取得
+    
         const relatedTasks = [];
         const relatedRegex = /<a\s+href="https:\/\/momon-ga\.com\/(?:fanzine|magazine)\/(mo[0-9-]+)\/">[\s\S]*?<img[^>]*src="([^"]+)"[\s\S]*?alt="([^"]+)"[\s\S]*?(?:<div\s+class="post-list-wpulike">([^<]+)<\/div>)?[\s\S]*?<\/a>/gi;
         let relatedMatch;
@@ -209,7 +205,7 @@ app.get('/api/proxy-details', async (c) => {
     }
 });
 
-// ダイレクト画像プロキシ API (Base64 返却版)
+
 app.get('/api/image-proxy', async (c) => {
     const imageUrl = c.req.query('url');
     if (!imageUrl) return c.text("URL is required", 400);
